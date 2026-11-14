@@ -1,0 +1,109 @@
+"""Claude Code OAuth usage API adapter."""
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import subprocess
+import urllib.error
+import urllib.request
+
+from .base import QuotaWindow, first_value, numeric_percentage, reset_epoch
+
+
+URL = "https://api.anthropic.com/api/oauth/usage"
+OAUTH_BETA = "oauth-2025-04-20"
+FALLBACK_USER_AGENT = "claude-code/2.1.204"
+
+
+def default_credentials_path() -> pathlib.Path:
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    root = pathlib.Path(config_dir).expanduser() if config_dir else pathlib.Path.home() / ".claude"
+    return root / ".credentials.json"
+
+
+class ClaudeAdapter:
+    provider_key = "claude"
+    display_name = "Claude"
+
+    def __init__(self, credentials_path: pathlib.Path | str | None = None,
+                 user_agent: str | None = None):
+        self.credentials_path = (pathlib.Path(credentials_path) if credentials_path is not None
+                                 else default_credentials_path())
+        self._user_agent = user_agent
+
+    def read_access_token(self) -> str:
+        try:
+            credentials = json.loads(self.credentials_path.read_text(encoding="utf-8"))
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"Claude Code credentials not found at {self.credentials_path}; sign into Claude Code first"
+            ) from exc
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"Could not read Claude Code credentials: {exc}") from exc
+        oauth = credentials.get("claudeAiOauth") if isinstance(credentials, dict) else None
+        token = oauth.get("accessToken") if isinstance(oauth, dict) else None
+        if not token:
+            raise RuntimeError("No Claude Code OAuth token found; sign into Claude Code first")
+        return str(token)
+
+    def user_agent(self) -> str:
+        if self._user_agent:
+            return self._user_agent
+        try:
+            result = subprocess.run(
+                ["claude", "--version"], capture_output=True, text=True,
+                timeout=3, check=False,
+            )
+            version = (result.stdout or result.stderr).strip().split()
+            if result.returncode == 0 and version:
+                self._user_agent = f"claude-code/{version[-1]}"
+        except (OSError, subprocess.SubprocessError):
+            pass
+        self._user_agent = self._user_agent or FALLBACK_USER_AGENT
+        return self._user_agent
+
+    def fetch_usage(self) -> dict:
+        token = self.read_access_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": self.user_agent(),
+            "anthropic-beta": OAUTH_BETA,
+        }
+        request = urllib.request.Request(URL, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                payload = json.load(response)
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"Claude usage request failed (HTTP {exc.code})") from None
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Claude usage request failed: {exc.reason}") from None
+        if not isinstance(payload, dict):
+            raise ValueError("Claude usage response was not a JSON object")
+        return payload
+
+    def parse_response(self, payload: dict) -> list[QuotaWindow]:
+        if not isinstance(payload, dict):
+            raise ValueError("Claude usage response was not a JSON object")
+        windows = []
+        for key, label, aliases, duration in (
+            ("five_hour", "5h", ("five_hour", "fiveHour", "session"), 5 * 3600),
+            ("weekly", "7D", ("seven_day", "sevenDay", "weekly"), 7 * 86400),
+        ):
+            value = next((payload.get(name) for name in aliases
+                          if isinstance(payload.get(name), dict)), None)
+            if value is None:
+                continue
+            used = numeric_percentage(
+                first_value(value, "utilization", "used_percent", "usedPercent"),
+                "Claude", label,
+            )
+            reset = reset_epoch(first_value(value, "resets_at", "reset_at", "resetAt"))
+            if used is None and reset is None:
+                continue
+            windows.append(QuotaWindow(key, label, used, reset, duration))
+        if not windows:
+            raise ValueError("No recognizable Claude quota window in response")
+        return windows

@@ -4,7 +4,7 @@ Quota Logger is the planned shared home for Codex, Claude, and future quota coll
 
 ## Current phase
 
-This phase defines the database and imports the existing Codex and Claude `quota_samples` databases. It does not collect live data, install scheduled tasks, or change either existing application.
+The shared database and importer are in place, as are Codex and Claude provider adapters and a unified collector loop. The adapters retain provider-specific authentication and parsing while returning common quota-window values. The collector records each provider independently, so a provider failure is logged without preventing the next poll. This phase does not install scheduled tasks, make live API calls, or change either existing application.
 
 The database has:
 
@@ -31,3 +31,13 @@ By default, the importer reads:
 The output path is required, so importing cannot silently write into the live application database. Override a source with `--codex-db` or `--claude-db` when needed. The importer copies samples and raw response JSON; it never reads or copies authentication credentials.
 
 The existing databases and scheduled tasks are left untouched. For a later cutover, take a final consistent import after stopping the old collectors briefly, then start the unified collector and keep the original databases for rollback.
+
+## Collector adapters
+
+The Codex adapter reads `~/.codex/auth.json`; the Claude adapter reads `~/.claude/.credentials.json` or the directory selected by `CLAUDE_CONFIG_DIR`. Neither credential file is copied into the project or database. API response bodies are retained as `raw_json`, matching the existing loggers; access tokens and authorization headers are never stored.
+
+The collector polls providers independently once per minute by default. A failed request is recorded as a failed sample for that provider and does not prevent the next adapter from running. `--once` makes one live request to each provider, so use it only when you intend to contact both quota APIs.
+
+```powershell
+py -3 -m quota_logger.collector --help
+```

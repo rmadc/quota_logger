@@ -1,8 +1,12 @@
 """SQLite schema and connection helpers for the provider-neutral logger."""
 from __future__ import annotations
 
+import json
 import pathlib
 import sqlite3
+from collections.abc import Iterable
+
+from .models import QuotaWindow
 
 
 SCHEMA_VERSION = 1
@@ -91,3 +95,41 @@ def open_database(path: pathlib.Path | str) -> sqlite3.Connection:
         conn.close()
         raise
     return conn
+
+
+def record_sample(
+    conn: sqlite3.Connection,
+    provider_key: str,
+    display_name: str,
+    observed_at_utc: str,
+    *,
+    windows: Iterable[QuotaWindow] = (),
+    error: str | None = None,
+    raw_payload: dict | None = None,
+) -> int:
+    """Write one poll and all its quota windows as a single transaction."""
+    ok = error is None
+    raw_json = (json.dumps(raw_payload, separators=(",", ":"), ensure_ascii=False)
+                if raw_payload is not None else None)
+    with conn:
+        conn.execute("""
+            INSERT INTO providers(provider_key, display_name) VALUES (?, ?)
+            ON CONFLICT(provider_key) DO UPDATE SET display_name=excluded.display_name
+        """, (provider_key, display_name))
+        provider_id = conn.execute(
+            "SELECT provider_id FROM providers WHERE provider_key = ?", (provider_key,)
+        ).fetchone()[0]
+        cursor = conn.execute("""
+            INSERT INTO samples(provider_id, observed_at_utc, ok, error, raw_json)
+            VALUES (?, ?, ?, ?, ?)
+        """, (provider_id, observed_at_utc, int(ok), error, raw_json))
+        sample_id = cursor.lastrowid
+        if ok:
+            conn.executemany("""
+                INSERT INTO quota_windows
+                    (sample_id, window_key, window_label, used_pct,
+                     reset_at_epoch, window_seconds)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, [(sample_id, window.key, window.label, window.used_pct,
+                   window.reset_at_epoch, window.window_seconds) for window in windows])
+    return sample_id

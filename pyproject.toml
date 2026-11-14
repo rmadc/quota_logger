@@ -9,5 +9,8 @@ description = "A multi-provider quota history collector for local LLM tools"
 requires-python = ">=3.11"
 dependencies = []
 
+[project.scripts]
+quota-logger = "quota_logger.collector:main"
+
 [tool.setuptools]
-packages = ["quota_logger"]
+packages = ["quota_logger", "quota_logger.providers"]
