@@ -19,7 +19,7 @@ DAILY_RESET = int(dt.datetime(2026, 11, 15, 10, tzinfo=dt.timezone.utc).timestam
 
 
 class HistoryUiTests(unittest.TestCase):
-    def test_history_uses_one_chronological_row_per_provider_sample(self):
+    def test_history_renders_codex_and_claude_in_side_by_side_panes(self):
         with tempfile.TemporaryDirectory() as temp:
             path = pathlib.Path(temp) / "history.sqlite3"
             conn = open_database(path)
@@ -37,20 +37,26 @@ class HistoryUiTests(unittest.TestCase):
                 record_sample(conn, "future_llm", "Future LLM", "2026-11-14T10:00:10Z",
                               windows=[QuotaWindow("daily", "24h", 8, DAILY_RESET, 86_400)])
 
-                samples = history.fetch_samples(conn, limit=3)
-                definitions = history.window_definitions(conn)
-                _columns, header, width = history.build_layout(samples, definitions)
-                lines = [history.format_sample(conn, sample, definitions, _columns, False)
-                         for sample in samples]
-
-                self.assertEqual([sample.provider_key for sample in samples],
+                providers = history.provider_definitions(conn)
+                self.assertEqual([provider[1] for provider in providers],
                                  ["codex", "claude", "future_llm"])
-                self.assertEqual({item.key for item in definitions},
-                                 {"five_hour", "weekly", "daily"})
-                self.assertIn("Provider", header)
-                self.assertIn("24h", header)
-                self.assertTrue(all(len(line) == width for line in lines))
-                self.assertEqual(len(lines), 3)
+                codex, claude, future = providers
+                self.assertEqual([window.key for window in codex[3]], ["five_hour", "weekly"])
+                self.assertEqual([window.key for window in claude[3]], ["five_hour", "weekly"])
+                self.assertEqual([window.key for window in future[3]], ["daily"])
+                self.assertEqual(history.pane_header(codex[3])[1], 32)
+                self.assertEqual(history.pane_header(codex[3])[0],
+                                 "Time    5h   7D   5h ETA  7D ETA")
+                codex_sample = history.fetch_samples(conn, provider_id=codex[0])[0]
+                claude_sample = history.fetch_samples(conn, provider_id=claude[0])[0]
+                left = history.pane_row(conn, codex_sample, codex[3], False)
+                right = history.pane_row(conn, claude_sample, claude[3], False)
+                paired = history._paired(left, right, [32, 32])
+                self.assertIn(" | ", paired)
+                self.assertIn("12%", paired)
+                self.assertIn("20%", paired)
+                self.assertEqual(len(left), 32)
+                self.assertNotIn("Provider", history.pane_header(codex[3])[0])
             finally:
                 conn.close()
 

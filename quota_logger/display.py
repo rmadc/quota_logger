@@ -217,18 +217,22 @@ def reset_countdown(reset_epoch, sample_time: str, window_seconds: int | None) -
 
 
 def date_separator(day: str, width: int, enabled: bool) -> str:
-    width = max(width, 40)
+    width = max(width, 32)
     chars = list("-" * width)
     date_label = f"◆ {dt.date.fromisoformat(day).strftime('%d/%m/%y')} ◆"
-    positions = (0, round(width * 0.16), (width - len(date_label)) // 2,
-                 round(width * 0.68), width - 2)
+    center = width // 2
+    date_start = center - len(date_label) // 2
+    if width <= 36:
+        positions = (0, 6, date_start, date_start + len(date_label), width - 2)
+    else:
+        positions = (0, round(width * 0.16), date_start,
+                     round(width * 0.68), width - 2)
     for label, position in zip(("0x", "0.5x", date_label, "1.5x", "2x"), positions):
         chars[position:position + len(label)] = list(label)
     line = "".join(chars)
     if not enabled:
         return line
     pieces = []
-    center = width // 2
     for index, char in enumerate(line):
         pressure = (index / max(1, center) if index <= center else
                     1.0 + (index - center) / max(1, width - center - 1))
