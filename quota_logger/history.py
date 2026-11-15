@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 
 from .collector import DEFAULT_DATABASE
-from .display import (ansi_color, date_separator, local_time,
+from .display import (ansi_color, date_separator, fit_console_width, local_time,
                       quota_pressure, reset_countdown, weekly_pressure)
 
 
@@ -78,11 +78,13 @@ def provider_definitions(conn: sqlite3.Connection):
     result = []
     for provider_id, key, name in providers:
         rows = conn.execute("""
-            SELECT window_key, window_label, MAX(window_seconds)
+            SELECT window_key, MAX(window_label), MAX(window_seconds)
             FROM quota_windows JOIN samples USING(sample_id)
-            WHERE provider_id = ? GROUP BY window_key, window_label
+            WHERE provider_id = ? GROUP BY window_key
         """, (provider_id,)).fetchall()
-        windows = [WindowDefinition(*row) for row in rows]
+        canonical_labels = {"five_hour": "5h", "weekly": "7D"}
+        windows = [WindowDefinition(key, canonical_labels.get(key, label), duration)
+                   for key, label, duration in rows]
         windows.sort(key=lambda item: ({"five_hour": 0, "weekly": 1}.get(item.key, 2), item.key))
         if key in FALLBACK_WINDOWS:
             existing = {item.key for item in windows}
@@ -341,7 +343,12 @@ def main(argv=None):
             if successful:
                 last_values[provider[0]] = _quota_values(successful[-1])
         conn.commit()
-        print(f"Database: {display_database_path(args.db)}")
+        database_line = f"Database: {display_database_path(args.db)}"
+        pane_widths = [pane_header(provider[3])[1] for provider in providers]
+        output_width = (sum(pane_widths) + 3 * (len(pane_widths) - 1)
+                        if len(providers) == 2 else max(pane_widths, default=0))
+        fit_console_width(max(output_width, len(database_line)))
+        print(database_line)
         if len(providers) == 2:
             widths = [pane_header(p[3])[1] for p in providers]
             print_paired(providers, panes, widths)

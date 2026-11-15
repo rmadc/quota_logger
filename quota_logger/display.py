@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 import datetime as dt
+import ctypes
+import os
+import sys
+from ctypes import wintypes
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
@@ -239,3 +243,55 @@ def date_separator(day: str, width: int, enabled: bool) -> str:
         red, green, blue = pressure_rgb(pressure, SEPARATOR_BRIGHTNESS)
         pieces.append(f"\x1b[38;2;{red};{green};{blue}m{char}")
     return "".join(pieces) + RESET
+
+
+def fit_console_width(requested: int) -> None:
+    """Narrow a Windows console to the rendered history width when possible."""
+    if os.name != "nt" or requested < 1:
+        return
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class COORD(ctypes.Structure):
+            _fields_ = [("X", wintypes.SHORT), ("Y", wintypes.SHORT)]
+
+        class SMALL_RECT(ctypes.Structure):
+            _fields_ = [("Left", wintypes.SHORT), ("Top", wintypes.SHORT),
+                        ("Right", wintypes.SHORT), ("Bottom", wintypes.SHORT)]
+
+        class CONSOLE_SCREEN_BUFFER_INFO(ctypes.Structure):
+            _fields_ = [("dwSize", COORD), ("dwCursorPosition", COORD),
+                        ("wAttributes", wintypes.WORD), ("srWindow", SMALL_RECT),
+                        ("dwMaximumWindowSize", COORD)]
+
+        get_handle = kernel32.GetStdHandle
+        get_handle.argtypes = [wintypes.DWORD]
+        get_handle.restype = wintypes.HANDLE
+        get_info = kernel32.GetConsoleScreenBufferInfo
+        get_info.argtypes = [wintypes.HANDLE, ctypes.POINTER(CONSOLE_SCREEN_BUFFER_INFO)]
+        get_info.restype = wintypes.BOOL
+        set_window = kernel32.SetConsoleWindowInfo
+        set_window.argtypes = [wintypes.HANDLE, wintypes.BOOL, ctypes.POINTER(SMALL_RECT)]
+        set_window.restype = wintypes.BOOL
+        set_buffer = kernel32.SetConsoleScreenBufferSize
+        set_buffer.argtypes = [wintypes.HANDLE, COORD]
+        set_buffer.restype = wintypes.BOOL
+
+        handle = get_handle(0xFFFFFFF5)  # STD_OUTPUT_HANDLE (-11)
+        info = CONSOLE_SCREEN_BUFFER_INFO()
+        if not get_info(handle, ctypes.byref(info)):
+            return
+        target = min(requested, info.dwSize.X)
+        current = info.srWindow.Right - info.srWindow.Left + 1
+        height = info.srWindow.Bottom - info.srWindow.Top + 1
+        if target < 1:
+            return
+        if target < current:
+            rect = SMALL_RECT(0, info.srWindow.Top, target - 1, info.srWindow.Bottom)
+            set_window(handle, True, ctypes.byref(rect))
+        if target < info.dwSize.X:
+            set_buffer(handle, COORD(target, info.dwSize.Y))
+        sys.stdout.write(f"\x1b[8;{height};{target}t")
+        sys.stdout.flush()
+    except (AttributeError, OSError, ValueError, ctypes.ArgumentError):
+        return
