@@ -4,7 +4,7 @@ Quota Logger is the planned shared home for Codex, Claude, and future quota coll
 
 ## Current phase
 
-The shared database and importer are in place, as are Codex and Claude provider adapters and a unified collector loop. The adapters retain provider-specific authentication and parsing while returning common quota-window values. The collector records each provider independently, so a provider failure is logged without preventing the next poll. This phase does not install scheduled tasks, make live API calls, or change either existing application.
+The shared database and importer are in place, as are Codex and Claude provider adapters, a unified collector loop, and side-by-side History and Config consoles. The adapters retain provider-specific authentication and parsing while returning common quota-window values. The collector records each provider independently, so a provider failure is logged without preventing the next poll.
 
 The database has:
 
@@ -44,6 +44,10 @@ py -3 -m quota_logger.collector --help
 
 ## Source console apps
 
-From this folder, run History with `py -3 -m quota_logger.history --follow`. It prints one row per sample, sorted by time, with provider and dynamic quota-window columns. Failed polls are hidden by default; add `--errors` to include them. Use `-N 100` to set the initial history length.
+From this folder, run History with `py -3 -m quota_logger.history --follow`. It prints Codex and Claude histories side by side, using the compact quota columns. Failed polls are hidden by default; add `--errors` to include them. Use `-N 100` to set the initial history length.
 
-Run Config with `py -3 -m quota_logger.config`. It shows the latest sample for each provider and offers per-user task controls. Choosing install/update, start, stop, restart, or uninstall changes the unified task; this source phase does not run those actions. `quota_history.ps1` and `quota_config.ps1` are convenience launchers for Windows PowerShell.
+Run Config with `py -3 -m quota_logger.config`. It shows the latest sample for each provider and offers per-user task controls. Choosing install/update, start, stop, restart, or uninstall changes the unified task. `quota_history.ps1` and `quota_config.ps1` are convenience launchers for Windows PowerShell.
+
+## Windows release
+
+Build the three executables with `build-release.ps1`; generated files go in the ignored `release/payload` directory. `release/install.cmd` copies them to the per-user Programs directory and creates Start Menu shortcuts. The installer does not modify scheduled tasks. See `release/README.txt` for build and install details.
