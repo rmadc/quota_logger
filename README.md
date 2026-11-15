@@ -41,3 +41,9 @@ The collector polls providers independently once per minute by default. A failed
 ```powershell
 py -3 -m quota_logger.collector --help
 ```
+
+## Source console apps
+
+From this folder, run History with `py -3 -m quota_logger.history --follow`. It prints one row per sample, sorted by time, with provider and dynamic quota-window columns. Failed polls are hidden by default; add `--errors` to include them. Use `-N 100` to set the initial history length.
+
+Run Config with `py -3 -m quota_logger.config`. It shows the latest sample for each provider and offers per-user task controls. Choosing install/update, start, stop, restart, or uninstall changes the unified task; this source phase does not run those actions. `quota_history.ps1` and `quota_config.ps1` are convenience launchers for Windows PowerShell.

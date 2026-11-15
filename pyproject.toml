@@ -11,6 +11,8 @@ dependencies = []
 
 [project.scripts]
 quota-logger = "quota_logger.collector:main"
+quota-history = "quota_logger.history:main"
+quota-config = "quota_logger.config:app_main"
 
 [tool.setuptools]
 packages = ["quota_logger", "quota_logger.providers"]
