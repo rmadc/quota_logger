@@ -25,6 +25,9 @@ It creates Start Menu shortcuts and keeps the shared database in:
 
   %LOCALAPPDATA%\Quota Logger\quota-history.sqlite3
 
+The History Start Menu shortcut follows new samples until you close it. Pass
+--no-follow to the EXE for a one-time snapshot.
+
 The installer does not register or change the background task. Open Config
 when you choose to configure collection. Config asks before installing or
 removing the per-user logon task. The collector reads the current user's

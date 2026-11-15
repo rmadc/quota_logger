@@ -311,6 +311,9 @@ def main(argv=None):
     parser.add_argument("-N", "--count", dest="count", type=int)
     parser.add_argument("--db", type=pathlib.Path, default=DEFAULT_DATABASE)
     parser.add_argument("--follow", action="store_true")
+    parser.add_argument("--no-follow", dest="follow", action="store_false",
+                        help="Show the current history and exit")
+    parser.set_defaults(follow=False)
     parser.add_argument("--errors", action="store_true")
     parser.add_argument("--no-color", action="store_true")
     args = parser.parse_args(argv)

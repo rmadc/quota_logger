@@ -10,6 +10,8 @@ from quota_logger import collector, config, history
 def main() -> int:
     executable = pathlib.Path(sys.argv[0]).stem.casefold()
     if "history" in executable:
+        if "--follow" not in sys.argv[1:] and "--no-follow" not in sys.argv[1:]:
+            return history.main(["--follow", *sys.argv[1:]])
         return history.main()
     if "config" in executable:
         return config.app_main()
