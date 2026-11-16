@@ -361,11 +361,14 @@ def main(argv=None):
                     print(line)
         if not args.follow:
             return 0
+        pending_samples = []
         while True:
             time.sleep(2)
             conn.execute("BEGIN")
             try:
-                new = fetch_samples(conn, after_id=last_id, include_errors=args.errors)
+                # Keep error rows while pairing so a failed provider poll cannot
+                # shift every subsequent Codex/Claude pair by one sample.
+                new = fetch_samples(conn, after_id=last_id, include_errors=True)
                 last_id = latest_sample_id(conn)
                 conn.commit()
             except Exception:
@@ -373,35 +376,56 @@ def main(argv=None):
                 raise
             if new:
                 # Keep follow output append-only so console scrollback remains usable.
-                by_provider = {provider[0]: [] for provider in providers}
-                for sample in new:
-                    if sample.provider_id not in by_provider:
-                        providers = provider_definitions(conn)
-                        by_provider[sample.provider_id] = []
-                    by_provider[sample.provider_id].append(sample)
-                pending = {}
-                for index, provider in enumerate(providers):
-                    samples = by_provider.get(provider[0], [])
-                    for sample in samples:
+                pending_samples.extend(new)
+                pending_samples.sort(key=lambda sample: sample.sample_id)
+                widths = [pane_header(p[3])[1] for p in providers]
+                provider_indices = {provider[0]: index
+                                    for index, provider in enumerate(providers)}
+                while len(providers) == 2 and len(pending_samples) >= 2:
+                    pair = pending_samples[:2]
+                    indices = [provider_indices.get(sample.provider_id) for sample in pair]
+                    if None in indices or indices[0] == indices[1]:
+                        # Preserve a possibly split poll until its partner arrives.
+                        break
+                    del pending_samples[:2]
+                    changed = []
+                    for index, sample in zip(indices, pair):
+                        provider = providers[index]
                         if sample.ok:
                             values = _quota_values(sample)
-                            if last_values.get(provider[0]) == values:
-                                continue
+                            changed.append(last_values.get(provider[0]) != values)
                             last_values[provider[0]] = values
-                        day = _sample_day(sample)
-                        lines = []
-                        if last_days[index] != day:
-                            lines.append(date_separator(day, pane_header(provider[3])[1], color))
-                            last_days[index] = day
-                        lines.append(pane_row(conn, sample, provider[3], color))
-                        pending.setdefault(sample.observed_at_utc, [[] for _ in providers])[index].extend(lines)
-                widths = [pane_header(p[3])[1] for p in providers]
-                for sides in pending.values():
-                    for row_index in range(max(map(len, sides))):
-                        left = sides[0][row_index] if row_index < len(sides[0]) else ""
-                        right = sides[1][row_index] if row_index < len(sides[1]) else ""
-                        if left or right:
-                            print(_paired(left, right, widths), flush=True)
+                        else:
+                            changed.append(args.errors)
+                    if not any(changed):
+                        continue
+
+                    day_changed = []
+                    for index, sample in zip(indices, pair):
+                        day_changed.append(last_days[index] != _sample_day(sample))
+                        last_days[index] = _sample_day(sample)
+                    show_day = any(day_changed)
+                    sides = ["", ""]
+                    if show_day:
+                        for index, sample in zip(indices, pair):
+                            sides[index] = date_separator(
+                                _sample_day(sample), widths[index], color)
+                    # Both panes represent the same collector poll, even if one
+                    # percentage did not change; this avoids blank counterpart rows.
+                    for index, sample in zip(indices, pair):
+                        provider = providers[index]
+                        if sample.ok or args.errors:
+                            row = pane_row(conn, sample, provider[3], color)
+                            if sides[index]:
+                                sides[index] += "\n" + row
+                            else:
+                                sides[index] = row
+                    left_lines = sides[0].splitlines()
+                    right_lines = sides[1].splitlines()
+                    for row_index in range(max(len(left_lines), len(right_lines))):
+                        left = left_lines[row_index] if row_index < len(left_lines) else ""
+                        right = right_lines[row_index] if row_index < len(right_lines) else ""
+                        print(_paired(left, right, widths), flush=True)
     except KeyboardInterrupt:
         print("\nStopped.")
     finally:
