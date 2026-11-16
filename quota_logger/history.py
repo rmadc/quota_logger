@@ -276,6 +276,62 @@ def _paired(left, right, widths):
     return _pad(left, widths[0]) + " | " + _pad(right, widths[1])
 
 
+def _aligned_rows(panes, widths):
+    count = min(map(len, panes))
+    if not count:
+        return []
+    return [_paired(left, right, widths)
+            for left, right in zip(panes[0][-count:], panes[1][-count:])]
+
+
+def _update_rows(previous, current):
+    """Rewrite only the changed suffix in the normal console scrollback buffer."""
+    first = 0
+    while first < min(len(previous), len(current)) and previous[first] == current[first]:
+        first += 1
+    if first == len(current) == len(previous):
+        return
+    if not sys.stdout.isatty():
+        print("\n".join(current), flush=True)
+        return
+    sys.stdout.flush()
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        class Coord(ctypes.Structure):
+            _fields_ = [("x", wintypes.SHORT), ("y", wintypes.SHORT)]
+
+        class Rect(ctypes.Structure):
+            _fields_ = [("left", wintypes.SHORT), ("top", wintypes.SHORT),
+                        ("right", wintypes.SHORT), ("bottom", wintypes.SHORT)]
+
+        class Info(ctypes.Structure):
+            _fields_ = [("size", Coord), ("cursor", Coord),
+                        ("attributes", wintypes.WORD), ("window", Rect),
+                        ("maximum", Coord)]
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.GetStdHandle.restype = wintypes.HANDLE
+        handle = kernel.GetStdHandle(-11)
+        kernel.GetConsoleScreenBufferInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(Info)]
+        kernel.SetConsoleCursorPosition.argtypes = [wintypes.HANDLE, Coord]
+        info = Info()
+        if not kernel.GetConsoleScreenBufferInfo(handle, ctypes.byref(info)):
+            raise OSError("Cannot read History console position")
+        target = info.cursor.y - len(previous) + first
+        if target < 0:
+            # The oldest rows have fallen out of the console buffer.
+            first -= target
+            target = 0
+        if not kernel.SetConsoleCursorPosition(handle, Coord(0, target)):
+            raise OSError("Cannot position History console cursor")
+    else:
+        sys.stdout.write(f"\x1b[{len(previous) - first}F")
+    sys.stdout.write("\n".join(current[first:]) + "\n")
+    sys.stdout.flush()
+
+
 def print_paired(providers, panes, widths):
     print(_paired(providers[0][2].upper(), providers[1][2].upper(), widths))
     print(_paired(pane_header(providers[0][3])[0], pane_header(providers[1][3])[0], widths))
@@ -361,71 +417,38 @@ def main(argv=None):
                     print(line)
         if not args.follow:
             return 0
-        pending_samples = []
+        previous_rows = _aligned_rows(panes, widths) if len(providers) == 2 else []
         while True:
             time.sleep(2)
             conn.execute("BEGIN")
             try:
-                # Keep error rows while pairing so a failed provider poll cannot
-                # shift every subsequent Codex/Claude pair by one sample.
-                new = fetch_samples(conn, after_id=last_id, include_errors=True)
+                new = fetch_samples(conn, after_id=last_id, include_errors=args.errors)
                 last_id = latest_sample_id(conn)
                 conn.commit()
             except Exception:
                 conn.rollback()
                 raise
-            if new:
-                # Keep follow output append-only so console scrollback remains usable.
-                pending_samples.extend(new)
-                pending_samples.sort(key=lambda sample: sample.sample_id)
-                widths = [pane_header(p[3])[1] for p in providers]
-                provider_indices = {provider[0]: index
-                                    for index, provider in enumerate(providers)}
-                while len(providers) == 2 and len(pending_samples) >= 2:
-                    pair = pending_samples[:2]
-                    indices = [provider_indices.get(sample.provider_id) for sample in pair]
-                    if None in indices or indices[0] == indices[1]:
-                        # Preserve a possibly split poll until its partner arrives.
-                        break
-                    del pending_samples[:2]
-                    changed = []
-                    for index, sample in zip(indices, pair):
-                        provider = providers[index]
-                        if sample.ok:
-                            values = _quota_values(sample)
-                            changed.append(last_values.get(provider[0]) != values)
-                            last_values[provider[0]] = values
-                        else:
-                            changed.append(args.errors)
-                    if not any(changed):
+            changed = False
+            for sample in new:
+                index = next((i for i, p in enumerate(providers)
+                              if p[0] == sample.provider_id), None)
+                if index is None:
+                    continue
+                if sample.ok:
+                    values = _quota_values(sample)
+                    if last_values.get(sample.provider_id) == values:
                         continue
-
-                    day_changed = []
-                    for index, sample in zip(indices, pair):
-                        day_changed.append(last_days[index] != _sample_day(sample))
-                        last_days[index] = _sample_day(sample)
-                    show_day = any(day_changed)
-                    sides = ["", ""]
-                    if show_day:
-                        for index, sample in zip(indices, pair):
-                            sides[index] = date_separator(
-                                _sample_day(sample), widths[index], color)
-                    # Both panes represent the same collector poll, even if one
-                    # percentage did not change; this avoids blank counterpart rows.
-                    for index, sample in zip(indices, pair):
-                        provider = providers[index]
-                        if sample.ok or args.errors:
-                            row = pane_row(conn, sample, provider[3], color)
-                            if sides[index]:
-                                sides[index] += "\n" + row
-                            else:
-                                sides[index] = row
-                    left_lines = sides[0].splitlines()
-                    right_lines = sides[1].splitlines()
-                    for row_index in range(max(len(left_lines), len(right_lines))):
-                        left = left_lines[row_index] if row_index < len(left_lines) else ""
-                        right = right_lines[row_index] if row_index < len(right_lines) else ""
-                        print(_paired(left, right, widths), flush=True)
+                    last_values[sample.provider_id] = values
+                day = _sample_day(sample)
+                if last_days[index] != day:
+                    panes[index].append(date_separator(day, pane_widths[index], color))
+                    last_days[index] = day
+                panes[index].append(pane_row(conn, sample, providers[index][3], color))
+                changed = True
+            if changed and len(providers) == 2:
+                rows = _aligned_rows(panes, widths)
+                _update_rows(previous_rows, rows)
+                previous_rows = rows
     except KeyboardInterrupt:
         print("\nStopped.")
     finally:
