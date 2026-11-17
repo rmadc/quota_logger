@@ -103,8 +103,9 @@ def quota_pressure(used_pct, reset_epoch, sample_time: str, window_seconds):
         return None
 
 
-def _recent_rate(history, sample_id, sample_epoch, reset_epoch):
-    window_start = sample_epoch - WEEKLY_LOOKBACK_MINUTES * 60
+def _recent_rate(history, sample_id, sample_epoch, reset_epoch,
+                 lookback_minutes=WEEKLY_LOOKBACK_MINUTES):
+    window_start = sample_epoch - lookback_minutes * 60
     current = None
     first_in_window = None
     baseline = None
@@ -139,7 +140,26 @@ def _recent_rate(history, sample_id, sample_epoch, reset_epoch):
 
 def weekly_pressure(used_pct, reset_epoch, sample_time: str, window_seconds,
                     history=(), sample_id=None):
-    """Codex method-1 weekly pace model, generalized to the window duration."""
+    """Weekly forecast using Madrid active hours and the existing method-1 settings."""
+    return _forecast_pressure(used_pct, reset_epoch, sample_time, window_seconds,
+                              history, sample_id, active_hours,
+                              EARLY_CUSHION_HOURS, WEEKLY_LOOKBACK_MINUTES, 8.0)
+
+
+def five_hour_pressure(used_pct, reset_epoch, sample_time: str, window_seconds,
+                       history=(), sample_id=None):
+    """Forecast 5h exhaustion using clock time and a short recent-rate window."""
+    def clock_hours(start, end):
+        return max(0.0, (end - start).total_seconds() / 3600.0)
+
+    return _forecast_pressure(used_pct, reset_epoch, sample_time, window_seconds,
+                              history, sample_id, clock_hours,
+                              5.0 / 60.0, 10, 8.0 * 5.0 / 168.0)
+
+
+def _forecast_pressure(used_pct, reset_epoch, sample_time, window_seconds,
+                       history, sample_id, hours_between, cushion_hours,
+                       lookback_minutes, warning_taper_hours):
     if used_pct is None or reset_epoch is None or not window_seconds:
         return None
     try:
@@ -154,19 +174,20 @@ def weekly_pressure(used_pct, reset_epoch, sample_time: str, window_seconds,
         begin = reset - dt.timedelta(seconds=int(window_seconds))
         if not begin <= sample <= reset:
             return quota_pressure(used_pct, reset_epoch, sample_time, window_seconds)
-        total = active_hours(begin, reset)
-        elapsed = active_hours(begin, sample)
-        remaining = active_hours(sample, reset)
+        total = hours_between(begin, reset)
+        elapsed = hours_between(begin, sample)
+        remaining = hours_between(sample, reset)
         if total <= 0.0:
             return None
-        elapsed_effective = min(total, elapsed + EARLY_CUSHION_HOURS)
+        elapsed_effective = min(total, elapsed + cushion_hours)
         cumulative_rate = used / elapsed_effective if elapsed_effective else 0.0
         budget_pressure = (used * total / (100.0 * elapsed_effective)
                            if used else 0.0)
-        budget_warning = budget_pressure * min(1.0, remaining / 8.0)
+        budget_warning = budget_pressure * min(1.0, remaining / warning_taper_hours)
         burst_rate = None
         if sample_id is not None and history:
-            burst_rate = _recent_rate(history, sample_id, sample.timestamp(), reset_epoch)
+            burst_rate = _recent_rate(history, sample_id, sample.timestamp(), reset_epoch,
+                                      lookback_minutes)
         if burst_rate is None:
             forecast_rate = cumulative_rate
         else:

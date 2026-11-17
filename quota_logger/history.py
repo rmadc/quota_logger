@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 
 from .collector import DEFAULT_DATABASE
-from .display import (ansi_color, date_separator, fit_console_width, local_time,
+from .display import (ansi_color, date_separator, fit_console_width, five_hour_pressure, local_time,
                       quota_pressure, reset_countdown, weekly_pressure)
 
 
@@ -156,13 +156,14 @@ def provider_window_history(conn, sample, window_key, reset, sample_epoch):
 
 def _window_pressure(conn, sample, definition, value, reset, duration):
     reset = _effective_reset(sample, value, reset, duration)
-    if definition.key == "weekly":
+    if definition.key in ("weekly", "five_hour"):
         history = ()
         if reset is not None:
             parsed = dt.datetime.fromisoformat(sample.observed_at_utc.replace("Z", "+00:00"))
             history = provider_window_history(conn, sample, definition.key, reset, parsed.timestamp())
-        return weekly_pressure(value, reset, sample.observed_at_utc, duration,
-                               history=history, sample_id=sample.sample_id)
+        forecast = weekly_pressure if definition.key == "weekly" else five_hour_pressure
+        return forecast(value, reset, sample.observed_at_utc, duration,
+                        history=history, sample_id=sample.sample_id)
     return quota_pressure(value, reset, sample.observed_at_utc, duration)
 
 
@@ -201,6 +202,24 @@ def pane_header(windows):
 
 
 def pane_row(conn, sample, windows, color):
+    if not sample.ok:
+        error = " ".join((sample.error or "Unknown error").split())
+        lower = error.lower()
+        if ("http 401" in lower or "expired" in lower
+                or "sign into" in lower or "no claude code oauth token" in lower):
+            message = "ERR: Sign in again"
+        elif "http 429" in lower:
+            message = "ERR: HTTP 429 rate limited"
+        elif "timed out" in lower or "timeout" in lower:
+            message = "ERR: Request timed out"
+        else:
+            message = "ERR: " + error.split(": ", 1)[-1]
+        width = pane_header(windows)[1]
+        available = width - 6
+        if len(message) > available:
+            message = message[:available - 1] + "…"
+        message = message.ljust(available)
+        return local_time(sample.observed_at_utc) + " " + ansi_color(message, 2.0, color)
     values = [local_time(sample.observed_at_utc)]
     for definition in windows:
         current = sample.windows.get(definition.key)
@@ -212,8 +231,6 @@ def pane_row(conn, sample, windows, color):
         pressure = _window_pressure(conn, sample, definition, used, reset, duration)
         eta = _window_eta(sample, used, reset, duration)
         values.extend((ansi_color(pct, pressure, color), eta))
-    if not sample.ok:
-        values[1] = ansi_color("ERR", 2.0, color) if color else "ERR"
     if len(windows) == 2 and [w.key for w in windows] == ["five_hour", "weekly"]:
         widths = (5, 5, 5, 8, 7)
     else:
@@ -238,17 +255,21 @@ def pane_row(conn, sample, windows, color):
 
 
 def _changed_samples(samples):
-    """Keep first success and samples whose displayed quota percentages changed."""
+    """Show quota changes and only the latest unresolved retrieval error."""
     shown = []
     previous = None
+    pending_error = None
     for sample in samples:
         if not sample.ok:
-            shown.append(sample)
+            pending_error = sample
             continue
-        current = tuple((key, value[1]) for key, value in sorted(sample.windows.items()))
-        if previous is None or current != previous:
+        current = _quota_values(sample)
+        if previous is None or current != previous or pending_error is not None:
             shown.append(sample)
         previous = current
+        pending_error = None
+    if pending_error is not None:
+        shown.append(pending_error)
     return shown
 
 
@@ -328,7 +349,11 @@ def _update_rows(previous, current):
             raise OSError("Cannot position History console cursor")
     else:
         sys.stdout.write(f"\x1b[{len(previous) - first}F")
-    sys.stdout.write("\n".join(current[first:]) + "\n")
+    surplus = max(0, len(previous) - len(current))
+    tail = current[first:] + [" " * _visible_width(previous[0])] * surplus
+    sys.stdout.write("\n".join(tail) + "\n")
+    if surplus:
+        sys.stdout.write(f"\x1b[{surplus}F")
     sys.stdout.flush()
 
 
@@ -372,7 +397,8 @@ def main(argv=None):
     parser.add_argument("--no-follow", dest="follow", action="store_false",
                         help="Show the current history and exit")
     parser.set_defaults(follow=False)
-    parser.add_argument("--errors", action="store_true")
+    parser.add_argument("--errors", action="store_true", default=True,
+                        help="Show failed retrievals (enabled by default)")
     parser.add_argument("--no-color", action="store_true")
     args = parser.parse_args(argv)
     limit = args.count if args.count is not None else (args.sample_count or 100)
@@ -396,7 +422,7 @@ def main(argv=None):
         last_values = {}
         for provider, samples in zip(providers, all_samples):
             successful = [sample for sample in samples if sample.ok]
-            if successful:
+            if successful and samples[-1].ok:
                 last_values[provider[0]] = _quota_values(successful[-1])
         conn.commit()
         database_line = f"Database: {display_database_path(args.db)}"
@@ -417,6 +443,7 @@ def main(argv=None):
                     print(line)
         if not args.follow:
             return 0
+        visible_samples = [_changed_samples(samples)[-limit:] for samples in all_samples]
         previous_rows = _aligned_rows(panes, widths) if len(providers) == 2 else []
         while True:
             time.sleep(2)
@@ -439,11 +466,12 @@ def main(argv=None):
                     if last_values.get(sample.provider_id) == values:
                         continue
                     last_values[sample.provider_id] = values
-                day = _sample_day(sample)
-                if last_days[index] != day:
-                    panes[index].append(date_separator(day, pane_widths[index], color))
-                    last_days[index] = day
-                panes[index].append(pane_row(conn, sample, providers[index][3], color))
+                else:
+                    last_values.pop(sample.provider_id, None)
+                visible_samples[index] = _changed_samples(
+                    visible_samples[index] + [sample])[-limit:]
+                panes[index] = _pane_lines(conn, visible_samples[index],
+                                           providers[index][3], color)
                 changed = True
             if changed and len(providers) == 2:
                 rows = _aligned_rows(panes, widths)
