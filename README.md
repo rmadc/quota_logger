@@ -1,18 +1,41 @@
 # Quota Logger
 
-Quota Logger is the planned shared home for Codex, Claude, and future quota collectors. Provider authentication and response parsing stay in provider adapters; samples and quota windows use a common SQLite schema.
+A Windows background collector and side-by-side history viewer for Codex and Claude Code quota usage. It records samples in a local SQLite database and shows 5-hour and weekly usage, reset times and pace colors.
 
-## Current phase
+## Requirements
 
-The shared database and importer are in place, as are Codex and Claude provider adapters, a unified collector loop, and side-by-side History and Config consoles. The adapters retain provider-specific authentication and parsing while returning common quota-window values. The collector records each provider independently, so a provider failure is logged without preventing the next poll.
+- Windows with PowerShell and Task Scheduler, and Python 3.11 or newer for building from source. The installed executables do not need Python.
+- Codex and/or Claude Code signed in with the relevant account. An unavailable provider is recorded as an error without stopping collection of the other provider.
+- An internet connection for installing the build dependency and retrieving quota data.
 
-The database has:
+The adapters use service usage endpoints and local CLI credentials. Their formats and availability can change; this project is independent of OpenAI and Anthropic.
 
-- `providers`: stable provider identifiers and display names.
-- `samples`: one poll result per provider, including UTC time, success/error, raw response, and optional import provenance.
-- `quota_windows`: zero or more named quota windows per successful sample, with utilization percentage, reset epoch, and optional period length.
+## Build and install
 
-Schema changes are tracked with SQLite `PRAGMA user_version`. The importer reads source databases in read-only transactions and is idempotent for the same source key and source sample IDs.
+Clone the repository, open PowerShell in its root, and run:
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-build.txt
+.\build-release.ps1
+.\release\install.cmd
+```
+
+If PowerShell blocks the build script, run `powershell -NoProfile -ExecutionPolicy Bypass -File .\build-release.ps1` instead. The build places its files in `release\payload`; the installer copies them to `%LOCALAPPDATA%\Programs\Quota Logger` and creates **Quota Logger Config** and **Quota Logger History** Start Menu shortcuts.
+
+Open **Quota Logger Config**, choose the option to install the background task, and then start it. The per-user task starts the collector at logon. Open **Quota Logger History** to follow changes. Each provider's newest unresolved retrieval error appears until a successful reading replaces it. History suppresses repeated unchanged percentages.
+
+To update, build the new release, stop the collector in Config, close both apps, and run `release\install.cmd` again. Open Config and start the collector afterwards. The installer preserves the database at `%LOCALAPPDATA%\Quota Logger\quota-history.sqlite3`.
+
+## Run from source
+
+From the repository root, use `py -3 -m quota_logger.history --follow` or `py -3 -m quota_logger.config`. The PowerShell launchers `quota_history.ps1` and `quota_config.ps1` provide shortcuts. Config manages the user's scheduled task; its source-mode task uses the current Python installation.
+
+The database stores quota responses and history, which may be personal. Credential files are read locally and are not copied into the database. The service responses themselves are retained as `raw_json`.
+
+## Database and migration
+
+The database stores providers, per-provider samples and named quota windows. Schema changes use SQLite `PRAGMA user_version`.
 
 ## Import existing databases
 
@@ -34,20 +57,6 @@ The existing databases and scheduled tasks are left untouched. For a later cutov
 
 ## Collector adapters
 
-The Codex adapter reads `~/.codex/auth.json`; the Claude adapter reads `~/.claude/.credentials.json` or the directory selected by `CLAUDE_CONFIG_DIR`. Neither credential file is copied into the project or database. API response bodies are retained as `raw_json`, matching the existing loggers; access tokens and authorization headers are never stored.
+The Codex adapter reads `~/.codex/auth.json`; the Claude adapter reads `~/.claude/.credentials.json` or the directory selected by `CLAUDE_CONFIG_DIR`. The collector polls providers independently once per minute by default. `py -3 -m quota_logger.collector --help` lists the collector options. `--once` makes a live request to both providers.
 
-The collector polls providers independently once per minute by default. A failed request is recorded as a failed sample for that provider and does not prevent the next adapter from running. `--once` makes one live request to each provider, so use it only when you intend to contact both quota APIs.
-
-```powershell
-py -3 -m quota_logger.collector --help
-```
-
-## Source console apps
-
-From this folder, run History with `py -3 -m quota_logger.history --follow`. It prints Codex and Claude histories side by side, using the compact quota columns. Failed polls are hidden by default; add `--errors` to include them. Use `-N 100` to set the initial history length.
-
-Run Config with `py -3 -m quota_logger.config`. It shows the latest sample for each provider and offers per-user task controls. Choosing install/update, start, stop, restart, or uninstall changes the unified task. `quota_history.ps1` and `quota_config.ps1` are convenience launchers for Windows PowerShell.
-
-## Windows release
-
-Build the three executables with `build-release.ps1`; generated files go in the ignored `release/payload` directory. `release/install.cmd` copies them to the per-user Programs directory and creates Start Menu shortcuts. The installer does not modify scheduled tasks. See `release/README.txt` for build and install details.
+See [release/README.txt](release/README.txt) for packaging and installation details.

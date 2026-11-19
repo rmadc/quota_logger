@@ -10,11 +10,13 @@ $spec = Join-Path $build 'spec'
 
 if (-not $Python) {
     $repoPython = Join-Path $root '.venv\Scripts\python.exe'
-    $Python = if (Test-Path -LiteralPath $repoPython) { $repoPython } else { 'py' }
+    if (-not (Test-Path -LiteralPath $repoPython)) {
+        throw 'Create .venv and install requirements-build.txt first, or pass -Python with the path to Python containing PyInstaller. See README.md.'
+    }
+    $Python = $repoPython
 }
-$pythonArgs = if ($Python -eq 'py') { @('-3') } else { @() }
 try {
-    & $Python @pythonArgs -m PyInstaller --version | Out-Null
+    & $Python -m PyInstaller --version | Out-Null
 } catch {
     throw 'PyInstaller is unavailable. Install requirements-build.txt or pass -Python with a Python that has PyInstaller installed.'
 }
@@ -40,7 +42,7 @@ function Build-App([string]$Name, [string]$Icon, [string]$Mode, [switch]$OneDir)
     else { $pyinstallerArgs += '--onefile' }
     if ($Mode -eq 'console') { $pyinstallerArgs += '--console' } else { $pyinstallerArgs += '--noconsole' }
     $pyinstallerArgs += (Join-Path $root 'quota_logger_app.py')
-    & $Python @pythonArgs @pyinstallerArgs
+    & $Python @pyinstallerArgs
     if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed for $Name." }
 }
 
