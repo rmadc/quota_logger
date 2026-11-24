@@ -46,10 +46,14 @@ if errorlevel 2 (
   exit /b 0
 )
 
-if not exist "%PROGRAMS%" mkdir "%PROGRAMS%"
-if errorlevel 1 goto :copy_failed
-if not exist "%DATA%" mkdir "%DATA%"
-if errorlevel 1 goto :copy_failed
+if not exist "%PROGRAMS%" (
+  mkdir "%PROGRAMS%"
+  if errorlevel 1 goto :copy_failed
+)
+if not exist "%DATA%" (
+  mkdir "%DATA%"
+  if errorlevel 1 goto :copy_failed
+)
 
 color 0B
 echo   [1/3] Updating Config...
