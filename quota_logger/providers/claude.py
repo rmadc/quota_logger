@@ -33,7 +33,8 @@ class ClaudeRateLimitError(RuntimeError):
         except (ValueError, TypeError, OverflowError):
             deadline = now + dt.timedelta(minutes=5)
         self.retry_at = max(now.timestamp(), deadline.timestamp())
-        super().__init__(f"Claude usage request failed (HTTP 429); retry_at={self.retry_at:.3f}")
+        header = "" if retry_after is None else f"; retry_after={json.dumps(retry_after)}"
+        super().__init__(f"Claude usage request failed (HTTP 429); retry_at={self.retry_at:.3f}{header}")
 
 
 def default_credentials_path() -> pathlib.Path:
