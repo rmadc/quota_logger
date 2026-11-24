@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import pathlib
+import re
 import sqlite3
 import sys
 import time
@@ -12,6 +13,7 @@ from collections.abc import Iterable
 from .database import open_database, record_sample
 from .providers import DEFAULT_ADAPTERS
 from .providers.base import ProviderAdapter
+from .providers.claude import ClaudeRateLimitError
 
 
 def local_data_dir() -> pathlib.Path:
@@ -35,13 +37,16 @@ def _display_value(value: float | None) -> str:
 
 
 def collect_provider(conn: sqlite3.Connection, adapter: ProviderAdapter,
-                     quiet: bool = False, observed_at_utc: str | None = None) -> bool:
+                     quiet: bool = False, observed_at_utc: str | None = None,
+                     retry_deadlines: dict[str, float] | None = None) -> bool:
     """Poll one provider; persist its failure without blocking other providers."""
     stamp = observed_at_utc or utc_now()
     try:
         payload = adapter.fetch_usage()
         windows = adapter.parse_response(payload)
     except Exception as exc:
+        if isinstance(exc, ClaudeRateLimitError) and retry_deadlines is not None:
+            retry_deadlines[adapter.provider_key] = exc.retry_at
         error = f"{type(exc).__name__}: {exc}"[:500]
         record_sample(conn, adapter.provider_key, adapter.display_name, stamp, error=error)
         if not quiet:
@@ -59,12 +64,31 @@ def collect_provider(conn: sqlite3.Connection, adapter: ProviderAdapter,
 
 
 def collect_once(conn: sqlite3.Connection, adapters: Iterable[ProviderAdapter],
-                 quiet: bool = False) -> dict[str, bool]:
+                 quiet: bool = False,
+                 retry_deadlines: dict[str, float] | None = None) -> dict[str, bool]:
     """Collect providers sequentially, isolating fetch/parse failures per provider."""
     results = {}
     for adapter in adapters:
-        results[adapter.provider_key] = collect_provider(conn, adapter, quiet=quiet)
+        if retry_deadlines is not None and time.time() < retry_deadlines.get(adapter.provider_key, 0):
+            continue
+        results[adapter.provider_key] = collect_provider(conn, adapter, quiet=quiet,
+                                                         retry_deadlines=retry_deadlines)
     return results
+
+
+def pending_retry_deadlines(conn: sqlite3.Connection) -> dict[str, float]:
+    """Restore an unresolved rate limit after the collector restarts."""
+    rows = conn.execute("""
+        SELECT p.provider_key, s.ok, s.error FROM providers p JOIN samples s
+          ON s.sample_id = (SELECT MAX(sample_id) FROM samples WHERE provider_id = p.provider_id)
+        WHERE p.provider_key = 'claude'
+    """).fetchall()
+    deadlines = {}
+    for key, ok, error in rows:
+        match = re.search(r"HTTP 429\); retry_at=(\d+(?:\.\d+)?)", error or "")
+        if not ok and match and float(match.group(1)) > time.time():
+            deadlines[key] = float(match.group(1))
+    return deadlines
 
 
 def run(database: pathlib.Path, interval_seconds: int = 60, once: bool = False,
@@ -73,6 +97,7 @@ def run(database: pathlib.Path, interval_seconds: int = 60, once: bool = False,
         raise ValueError("Polling interval must be at least one second")
     adapters = tuple(adapters)
     conn = open_database(database)
+    retry_deadlines = pending_retry_deadlines(conn)
     if not quiet:
         print(f"Database: {database.expanduser().resolve()}")
         print(f"Providers: {', '.join(adapter.display_name for adapter in adapters)}")
@@ -80,7 +105,7 @@ def run(database: pathlib.Path, interval_seconds: int = 60, once: bool = False,
     try:
         while True:
             started = time.monotonic()
-            collect_once(conn, adapters, quiet=quiet)
+            collect_once(conn, adapters, quiet=quiet, retry_deadlines=retry_deadlines)
             if once:
                 break
             time.sleep(max(0, interval_seconds - (time.monotonic() - started)))

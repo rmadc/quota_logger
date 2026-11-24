@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import datetime as dt
+import email.utils
 import os
 import pathlib
 import subprocess
@@ -14,6 +16,24 @@ from .base import QuotaWindow, first_value, numeric_percentage, reset_epoch
 URL = "https://api.anthropic.com/api/oauth/usage"
 OAUTH_BETA = "oauth-2025-04-20"
 FALLBACK_USER_AGENT = "claude-code/2.1.204"
+
+
+class ClaudeRateLimitError(RuntimeError):
+    def __init__(self, retry_after):
+        now = dt.datetime.now(dt.timezone.utc)
+        try:
+            value = (retry_after or "").strip()
+            if value.isascii() and value.isdigit():
+                seconds = int(value)
+                deadline = now + dt.timedelta(seconds=seconds)
+            else:
+                deadline = email.utils.parsedate_to_datetime(value)
+                if deadline is None or deadline.tzinfo is None:
+                    raise ValueError("Invalid Retry-After date")
+        except (ValueError, TypeError, OverflowError):
+            deadline = now + dt.timedelta(minutes=5)
+        self.retry_at = max(now.timestamp(), deadline.timestamp())
+        super().__init__(f"Claude usage request failed (HTTP 429); retry_at={self.retry_at:.3f}")
 
 
 def default_credentials_path() -> pathlib.Path:
@@ -77,6 +97,8 @@ class ClaudeAdapter:
             with urllib.request.urlopen(request, timeout=15) as response:
                 payload = json.load(response)
         except urllib.error.HTTPError as exc:
+            if exc.code == 429:
+                raise ClaudeRateLimitError(exc.headers.get("Retry-After") if exc.headers else None) from None
             raise RuntimeError(f"Claude usage request failed (HTTP {exc.code})") from None
         except urllib.error.URLError as exc:
             raise RuntimeError(f"Claude usage request failed: {exc.reason}") from None
