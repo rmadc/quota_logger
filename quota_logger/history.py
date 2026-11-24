@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import datetime as dt
 import os
 import pathlib
@@ -98,7 +99,8 @@ def provider_definitions(conn: sqlite3.Connection):
 
 def fetch_samples(conn: sqlite3.Connection, limit: int | None = None,
                   after_id: int | None = None, include_errors: bool = False,
-                  provider_id: int | None = None) -> list[HistorySample]:
+                  provider_id: int | None = None,
+                  since_utc: str | None = None) -> list[HistorySample]:
     conditions = []
     params: list[object] = []
     if after_id is not None:
@@ -109,6 +111,9 @@ def fetch_samples(conn: sqlite3.Connection, limit: int | None = None,
     if provider_id is not None:
         conditions.append("s.provider_id = ?")
         params.append(provider_id)
+    if since_utc is not None:
+        conditions.append("julianday(s.observed_at_utc) >= julianday(?)")
+        params.append(since_utc)
     if limit is not None and after_id is None:
         if provider_id is None:
             conditions.append("s.sample_id IN (SELECT sample_id FROM samples "
@@ -154,13 +159,19 @@ def provider_window_history(conn, sample, window_key, reset, sample_epoch):
             for sid, stamp, pct, epoch in rows]
 
 
-def _window_pressure(conn, sample, definition, value, reset, duration):
+def _window_pressure(conn, sample, definition, value, reset, duration, history_index=None):
     reset = _effective_reset(sample, value, reset, duration)
     if definition.key in ("weekly", "five_hour"):
         history = ()
         if reset is not None:
             parsed = dt.datetime.fromisoformat(sample.observed_at_utc.replace("Z", "+00:00"))
-            history = provider_window_history(conn, sample, definition.key, reset, parsed.timestamp())
+            if history_index is None:
+                history = provider_window_history(conn, sample, definition.key, reset, parsed.timestamp())
+            else:
+                entries = history_index.get((definition.key, reset), ())
+                end = bisect.bisect_right(entries, sample.sample_id, key=lambda entry: entry[0])
+                cutoff = parsed.timestamp() - 3 * 3600
+                history = [entry for entry in entries[:end] if entry[1] >= cutoff]
         forecast = weekly_pressure if definition.key == "weekly" else five_hour_pressure
         return forecast(value, reset, sample.observed_at_utc, duration,
                         history=history, sample_id=sample.sample_id)
@@ -201,7 +212,7 @@ def pane_header(windows):
     return header, len(header)
 
 
-def pane_row(conn, sample, windows, color):
+def pane_row(conn, sample, windows, color, history_index=None):
     if not sample.ok:
         error = " ".join((sample.error or "Unknown error").split())
         lower = error.lower()
@@ -228,7 +239,7 @@ def pane_row(conn, sample, windows, color):
             continue
         _label, used, reset, duration = current
         pct = "-" if used is None else f"{used:g}%"
-        pressure = _window_pressure(conn, sample, definition, used, reset, duration)
+        pressure = _window_pressure(conn, sample, definition, used, reset, duration, history_index)
         eta = _window_eta(sample, used, reset, duration)
         values.extend((ansi_color(pct, pressure, color), eta))
     if len(windows) == 2 and [w.key for w in windows] == ["five_hour", "weekly"]:
@@ -277,15 +288,37 @@ def _quota_values(sample):
     return tuple((key, value[1]) for key, value in sorted(sample.windows.items()))
 
 
-def _pane_lines(conn, samples, windows, color):
+def recent_provider_samples(conn, provider_id, limit, include_errors):
+    """Fetch enough recent polls to identify the last N displayed changes."""
+    batch = max(512, limit * 4)
+    while True:
+        samples = fetch_samples(conn, limit=batch, include_errors=include_errors,
+                                provider_id=provider_id)
+        if len(samples) < batch or len(_changed_samples(samples)) > limit:
+            return samples
+        batch *= 2
+
+
+def _pane_lines(conn, samples, windows, color, history_samples=None):
     lines = []
     last_day = None
+    history_index = None
+    if history_samples is not None:
+        history_index = {}
+        for sample in sorted(history_samples, key=lambda item: item.sample_id):
+            if not sample.ok:
+                continue
+            epoch = dt.datetime.fromisoformat(sample.observed_at_utc.replace("Z", "+00:00")).timestamp()
+            for key, (_label, used, reset, _duration) in sample.windows.items():
+                if reset is not None:
+                    history_index.setdefault((key, reset), []).append(
+                        (sample.sample_id, epoch, used, reset))
     for sample in samples:
         day = _sample_day(sample)
         if day != last_day:
             lines.append(date_separator(day, pane_header(windows)[1], color))
             last_day = day
-        lines.append(pane_row(conn, sample, windows, color))
+        lines.append(pane_row(conn, sample, windows, color, history_index))
     return lines
 
 
@@ -405,6 +438,9 @@ def main(argv=None):
     if limit < 1:
         parser.error("N must be positive")
     ensure_legend_encoding()
+    database_line = f"Database: {display_database_path(args.db)}"
+    fit_console_width(max(67, len(database_line)))
+    print(database_line, flush=True)
     try:
         conn = connect_readonly(args.db)
     except (OSError, sqlite3.Error) as exc:
@@ -414,10 +450,21 @@ def main(argv=None):
         conn.execute("BEGIN")
         providers = provider_definitions(conn)
         last_id = latest_sample_id(conn)
-        all_samples = [fetch_samples(conn, limit=None, include_errors=args.errors,
-                                     provider_id=provider[0]) for provider in providers]
-        panes = [_pane_lines(conn, _changed_samples(samples)[-limit:], provider[3], color)
-                 for provider, samples in zip(providers, all_samples)]
+        all_samples = [recent_provider_samples(conn, provider[0], limit, args.errors)
+                       for provider in providers]
+        visible_samples = [_changed_samples(samples)[-limit:] for samples in all_samples]
+        history_samples = []
+        for provider, samples in zip(providers, visible_samples):
+            if not samples:
+                history_samples.append([])
+                continue
+            first = min(dt.datetime.fromisoformat(s.observed_at_utc.replace("Z", "+00:00"))
+                        for s in samples)
+            since = (first - dt.timedelta(hours=3)).isoformat()
+            history_samples.append(fetch_samples(conn, provider_id=provider[0],
+                                                 include_errors=False, since_utc=since))
+        panes = [_pane_lines(conn, visible, provider[3], color, history)
+                 for provider, visible, history in zip(providers, visible_samples, history_samples)]
         last_days = [(_sample_day(samples[-1]) if samples else None) for samples in all_samples]
         last_values = {}
         for provider, samples in zip(providers, all_samples):
@@ -425,12 +472,10 @@ def main(argv=None):
             if successful and samples[-1].ok:
                 last_values[provider[0]] = _quota_values(successful[-1])
         conn.commit()
-        database_line = f"Database: {display_database_path(args.db)}"
         pane_widths = [pane_header(provider[3])[1] for provider in providers]
         output_width = (sum(pane_widths) + 3 * (len(pane_widths) - 1)
                         if len(providers) == 2 else max(pane_widths, default=0))
         fit_console_width(max(output_width, len(database_line)))
-        print(database_line)
         if len(providers) == 2:
             widths = [pane_header(p[3])[1] for p in providers]
             print_paired(providers, panes, widths)
@@ -443,7 +488,6 @@ def main(argv=None):
                     print(line)
         if not args.follow:
             return 0
-        visible_samples = [_changed_samples(samples)[-limit:] for samples in all_samples]
         previous_rows = _aligned_rows(panes, widths) if len(providers) == 2 else []
         while True:
             time.sleep(2)
@@ -470,8 +514,10 @@ def main(argv=None):
                     last_values.pop(sample.provider_id, None)
                 visible_samples[index] = _changed_samples(
                     visible_samples[index] + [sample])[-limit:]
+                history_samples = fetch_samples(conn, limit=None, include_errors=False,
+                                                provider_id=providers[index][0])
                 panes[index] = _pane_lines(conn, visible_samples[index],
-                                           providers[index][3], color)
+                                           providers[index][3], color, history_samples)
                 changed = True
             if changed and len(providers) == 2:
                 rows = _aligned_rows(panes, widths)
