@@ -4,9 +4,10 @@ import json
 import pathlib
 import tempfile
 import unittest
+import urllib.error
 from unittest import mock
 
-from quota_logger.collector import collect_once
+from quota_logger.collector import collect_once, pending_rejected_tokens
 from quota_logger.database import open_database
 from quota_logger.models import QuotaWindow
 from quota_logger.providers.base import reset_epoch
@@ -132,6 +133,91 @@ class ProviderAdapterTests(unittest.TestCase):
                 self.assertEqual(conn.execute(
                     "SELECT COUNT(*) FROM quota_windows"
                 ).fetchone()[0], 1)
+            finally:
+                conn.close()
+
+    def test_claude_401_pauses_until_token_changes_even_after_restart(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            credentials = root / "credentials.json"
+            def write_token(token):
+                credentials.write_text(json.dumps({"claudeAiOauth": {"accessToken": token}}),
+                                       encoding="utf-8")
+            write_token("rejected-fixture-token")
+            adapter = ClaudeAdapter(credentials, user_agent="fixture")
+            conn = open_database(root / "quota.sqlite3")
+            try:
+                blocked = {}
+                failure = urllib.error.HTTPError("https://example.invalid", 401, "Unauthorized", {}, None)
+                with mock.patch.object(adapter, "try_cli_refresh", return_value=None) as refresh, \
+                     mock.patch("quota_logger.providers.claude.urllib.request.urlopen", side_effect=failure) as request:
+                    collect_once(conn, [adapter, FakeAdapter()], quiet=True, rejected_tokens=blocked)
+                    restored = pending_rejected_tokens(conn)
+                    self.assertEqual(blocked, restored)
+                    collect_once(conn, [adapter, FakeAdapter()], quiet=True, rejected_tokens=restored)
+                    self.assertEqual(request.call_count, 1)
+                    refresh.assert_called_once()
+                error = conn.execute("SELECT error FROM samples WHERE ok=0").fetchone()[0]
+                self.assertNotIn("rejected-fixture-token", error)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM samples WHERE ok=0").fetchone()[0], 1)
+                write_token("renewed-fixture-token")
+                with mock.patch("quota_logger.providers.claude.urllib.request.urlopen",
+                                return_value=io.BytesIO(json.dumps(CLAUDE_FIXTURE).encode())) as request:
+                    collect_once(conn, [adapter], quiet=True, rejected_tokens=restored,
+                                 retry_deadlines={"claude": float("inf")})
+                    request.assert_not_called()
+                    collect_once(conn, [adapter], quiet=True, rejected_tokens=restored)
+                    request.assert_called_once()
+                self.assertEqual(restored, {})
+                self.assertEqual(pending_rejected_tokens(conn), {})
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM samples WHERE ok=1").fetchone()[0], 3)
+            finally:
+                conn.close()
+
+    def test_claude_refreshes_once_then_retries_with_new_token(self):
+        with tempfile.TemporaryDirectory() as temp:
+            credentials = pathlib.Path(temp) / "credentials.json"
+            def write_token(token):
+                credentials.write_text(json.dumps({"claudeAiOauth": {"accessToken": token}}),
+                                       encoding="utf-8")
+            write_token("old-fixture-token")
+            adapter = ClaudeAdapter(credentials, user_agent="fixture")
+            failure = urllib.error.HTTPError("https://example.invalid", 401, "Unauthorized", {}, None)
+            response = io.BytesIO(json.dumps(CLAUDE_FIXTURE).encode())
+            def cli_refresh(*args, **kwargs):
+                write_token("new-fixture-token")
+                return mock.Mock(returncode=0)
+            with mock.patch("quota_logger.providers.claude.subprocess.run", side_effect=cli_refresh) as cli, \
+                 mock.patch("quota_logger.providers.claude.urllib.request.urlopen", side_effect=[failure, response]) as request:
+                self.assertEqual(adapter.fetch_usage(), CLAUDE_FIXTURE)
+                self.assertEqual(cli.call_args.args[0], ["claude", "-p", "/usage"])
+                self.assertEqual(request.call_count, 2)
+                headers = {k.lower(): v for k, v in request.call_args.args[0].header_items()}
+                self.assertEqual(headers["authorization"], "Bearer new-fixture-token")
+
+    def test_refresh_event_is_saved_without_credentials(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            credentials = root / "credentials.json"
+            def write_token(token):
+                credentials.write_text(json.dumps({"claudeAiOauth": {"accessToken": token}}),
+                                       encoding="utf-8")
+            write_token("old-fixture-token")
+            adapter = ClaudeAdapter(credentials, user_agent="fixture")
+            failure = urllib.error.HTTPError("https://example.invalid", 401, "Unauthorized", {}, None)
+            response = io.BytesIO(json.dumps(CLAUDE_FIXTURE).encode())
+            def cli_refresh(*args, **kwargs):
+                write_token("new-fixture-token")
+                return mock.Mock(returncode=0)
+            conn = open_database(root / "quota.sqlite3")
+            try:
+                with mock.patch("quota_logger.providers.claude.subprocess.run", side_effect=cli_refresh), \
+                     mock.patch("quota_logger.providers.claude.urllib.request.urlopen", side_effect=[failure, response]):
+                    self.assertEqual(collect_once(conn, [adapter], quiet=True), {"claude": True})
+                event = (root / "collector-events.log").read_text(encoding="utf-8")
+                self.assertIn("Claude CLI refresh attempted; access token changed", event)
+                self.assertNotIn("fixture-token", event)
+                self.assertIsNone(adapter.refresh_event)
             finally:
                 conn.close()
 

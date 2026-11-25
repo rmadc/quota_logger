@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import datetime as dt
 import email.utils
+import hashlib
 import os
 import pathlib
 import subprocess
@@ -16,6 +17,18 @@ from .base import QuotaWindow, first_value, numeric_percentage, reset_epoch
 URL = "https://api.anthropic.com/api/oauth/usage"
 OAUTH_BETA = "oauth-2025-04-20"
 FALLBACK_USER_AGENT = "claude-code/2.1.204"
+
+
+def token_fingerprint(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+class ClaudeAuthenticationError(RuntimeError):
+    def __init__(self, token, refresh_attempted=False):
+        self.token_fingerprint = token_fingerprint(token)
+        super().__init__("Claude usage request failed (HTTP 401); sign in again; "
+                         f"token_fingerprint={self.token_fingerprint}; "
+                         f"refresh_attempted={int(refresh_attempted)}")
 
 
 class ClaudeRateLimitError(RuntimeError):
@@ -52,6 +65,7 @@ class ClaudeAdapter:
         self.credentials_path = (pathlib.Path(credentials_path) if credentials_path is not None
                                  else default_credentials_path())
         self._user_agent = user_agent
+        self.refresh_event = None
 
     def read_access_token(self) -> str:
         try:
@@ -84,8 +98,49 @@ class ClaudeAdapter:
         self._user_agent = self._user_agent or FALLBACK_USER_AGENT
         return self._user_agent
 
+    def current_token_fingerprint(self) -> str | None:
+        try:
+            return token_fingerprint(self.read_access_token())
+        except RuntimeError:
+            return None
+
+    def try_cli_refresh(self, rejected_token: str) -> str | None:
+        """Ask Claude Code to refresh its own credentials at most once."""
+        try:
+            current = self.read_access_token()
+            if current != rejected_token:
+                return current
+            env = os.environ.copy()
+            env["CLAUDE_CONFIG_DIR"] = str(self.credentials_path.parent)
+            subprocess.run(["claude", "-p", "/usage"], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=60, check=False, env=env,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except (OSError, subprocess.SubprocessError, RuntimeError):
+            pass
+        try:
+            current = self.read_access_token()
+            if current != rejected_token:
+                self.refresh_event = "Claude CLI refresh attempted; access token changed"
+            return current if current != rejected_token else None
+        except RuntimeError:
+            return None
+
     def fetch_usage(self) -> dict:
+        self.refresh_event = None
         token = self.read_access_token()
+        try:
+            return self._fetch_with_token(token)
+        except ClaudeAuthenticationError:
+            refreshed = self.try_cli_refresh(token)
+            if refreshed is None:
+                raise ClaudeAuthenticationError(token, refresh_attempted=True) from None
+            try:
+                return self._fetch_with_token(refreshed)
+            except ClaudeAuthenticationError:
+                raise ClaudeAuthenticationError(refreshed, refresh_attempted=True) from None
+
+    def _fetch_with_token(self, token: str) -> dict:
         headers = {
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
@@ -98,6 +153,8 @@ class ClaudeAdapter:
             with urllib.request.urlopen(request, timeout=15) as response:
                 payload = json.load(response)
         except urllib.error.HTTPError as exc:
+            if exc.code == 401:
+                raise ClaudeAuthenticationError(token) from None
             if exc.code == 429:
                 raise ClaudeRateLimitError(exc.headers.get("Retry-After") if exc.headers else None) from None
             raise RuntimeError(f"Claude usage request failed (HTTP {exc.code})") from None
